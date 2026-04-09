@@ -11,6 +11,7 @@ import logging
 import json
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Page, Browser
+from playwright_stealth import stealth_async
 from dotenv import load_dotenv
 from config import CHECK_INTERVAL, LANDING_PAGES, DIRECT_EVENTS, IGNORE_TICKET_TYPES
 
@@ -155,6 +156,7 @@ async def check_direct_event(browser: Browser, name: str, url: str) -> tuple[boo
     ctx = await browser.new_context(**CTX_ARGS)
     try:
         page = await ctx.new_page()
+        await stealth_async(page)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(5_000)
@@ -213,6 +215,7 @@ async def check_landing_page(browser: Browser, landing_url: str) -> list[dict]:
     ctx = await browser.new_context(**CTX_ARGS)
     try:
         page = await ctx.new_page()
+        await stealth_async(page)
         try:
             await page.goto(landing_url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(4_000)
@@ -316,6 +319,7 @@ async def main():
         # Página dedicada ao Telegram — usa fetch() do browser para sendMessage
         tg_ctx = await browser.new_context(**CTX_ARGS)
         tg_page = await tg_ctx.new_page()
+        await stealth_async(tg_page)
         # Navega para google.com — fetch() cross-origin ao Telegram funciona a partir daqui no WSL
         await tg_page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=15_000)
 
