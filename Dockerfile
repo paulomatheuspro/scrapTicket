@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY . .
 
-CMD ["python3", "-u", "monitor.py"]
+ENTRYPOINT ["python3", "-u", "monitor.py"]
