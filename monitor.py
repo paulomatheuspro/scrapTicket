@@ -157,7 +157,7 @@ async def check_direct_event(browser: Browser, name: str, url: str) -> tuple[boo
         page = await ctx.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            await page.wait_for_timeout(3_500)
+            await page.wait_for_timeout(5_000)
         except PWTimeout:
             log.error(f"  [{name}] Timeout")
             return False, []
@@ -186,11 +186,20 @@ async def check_direct_event(browser: Browser, name: str, url: str) -> tuple[boo
                 log.info(f"  [{name}] ESGOTADO (event-status)")
                 return False, []
 
-        # Sem botão + texto esgotado
-        if not await page.locator(".btn.btn-primary:visible").count():
-            if "esgotado" in (await page.inner_text("body")).lower()[:600]:
-                log.info(f"  [{name}] ESGOTADO (sem botão)")
-                return False, []
+        body_text = (await page.inner_text("body")).lower()
+
+        # Texto esgotado no topo da página
+        if "esgotado" in body_text[:600]:
+            log.info(f"  [{name}] ESGOTADO (texto)")
+            return False, []
+
+        # Confirmação positiva: só reporta disponível se houver botão de compra visível
+        # ou dropdown sem esgotado. Sem confirmação → assume indisponível (evita falso alarme).
+        has_buy_btn = await page.locator(".btn.btn-primary:visible").count() > 0
+        has_dropdown = await page.locator(".btn.dropdown-toggle.op-ini").count() > 0
+        if not has_buy_btn and not has_dropdown:
+            log.info(f"  [{name}] Página sem elementos de compra — assumindo indisponível")
+            return False, []
 
         sectors = await get_sectors(page)
         return True, sectors or [{"name": "Verificar setores no link", "price": ""}]
