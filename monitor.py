@@ -111,19 +111,50 @@ async def notify_personal(tg_page: Page, message: str) -> None:
     await send_telegram(tg_page, message, chat_id=PERSONAL_CHAT_ID)
 
 
-async def send_status(tg_page: Page) -> None:
-    """Envia relatório de status periódico para todos os chats."""
+def _build_status_msg() -> str:
     uptime = datetime.now() - inicio
     h, rem = divmod(int(uptime.total_seconds()), 3600)
     m, s = divmod(rem, 60)
-    msg = (
+    return (
         f"<b>📊 Monitor ativo</b>\n"
-        f"Checagens: <b>{checagens}</b>\n"
+        f"Ciclos: <b>{checagens}</b>\n"
         f"Rodando há: <b>{h}h {m}m {s}s</b>\n"
         f"Iniciado: {inicio.strftime('%d/%m/%Y %H:%M:%S')}"
     )
+
+
+async def send_status(tg_page: Page) -> None:
+    """Envia relatório de status periódico para todos os chats."""
+    msg = _build_status_msg()
     await send_telegram(tg_page, msg)
-    log.info(f"Status periódico enviado ({checagens} checagens, {h}h{m}m{s}s)")
+    log.info(f"Status periódico enviado ({checagens} ciclos)")
+
+
+async def commands_loop(tg_page: Page) -> None:
+    """Polling de comandos Telegram a cada 3s. Responde /s com status do monitor."""
+    offset = 0
+    while True:
+        try:
+            data = await tg_get(tg_page, "getUpdates", {
+                "offset": str(offset),
+                "limit": "10",
+                "timeout": "0",
+            })
+            for upd in (data.get("result") or []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                text = (msg.get("text") or "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if not chat_id:
+                    continue
+                # aceita /s e /s@NomeDoBot
+                if text == "/s" or text.lower().startswith("/s@"):
+                    reply = _build_status_msg()
+                    await send_telegram(tg_page, reply, chat_id=chat_id)
+                    log.info(f"Comando /s respondido para chat {chat_id} ({checagens} ciclos)")
+        except Exception as e:
+            log.warning(f"commands_loop erro: {e}")
+        await asyncio.sleep(3)
 
 
 # ── Detecção de setores ───────────────────────────────────────────────────────
@@ -406,7 +437,12 @@ async def main():
             log.info("  Nenhuma conversa recente. Adicione o bot a um grupo e envie uma mensagem, depois reinicie.")
         log.info("")
 
-        # getUpdates não funciona neste ambiente WSL — usamos relatório periódico a cada 30min
+        # Registra /s no menu de comandos do Telegram
+        await tg_post(tg_page, "setMyCommands", {
+            "commands": [{"command": "s", "description": "Status do monitor (ciclos e uptime)"}]
+        })
+        log.info("Comando /s registrado no Telegram.\n")
+
         STATUS_INTERVAL = 30 * 60  # segundos
 
         async def status_loop():
@@ -417,6 +453,7 @@ async def main():
                 await asyncio.sleep(STATUS_INTERVAL)
 
         poller = asyncio.create_task(status_loop())
+        cmd_poller = asyncio.create_task(commands_loop(tg_page))
 
         try:
             while True:
@@ -551,6 +588,7 @@ async def main():
             pass
         finally:
             poller.cancel()
+            cmd_poller.cancel()
             await tg_ctx.close()
             await browser.close()
 
