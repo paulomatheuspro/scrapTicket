@@ -21,6 +21,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_IDS", os.getenv("TELEGRAM_CHAT_ID", "")).split(",") if cid.strip()]
 TELEGRAM_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# ID pessoal — recebe alertas de erro, página offline e elementos inesperados
+PERSONAL_CHAT_ID = "1938486252"
+
 checagens = 0
 inicio = datetime.now()
 
@@ -103,6 +106,11 @@ async def send_telegram(tg_page: Page, message: str, chat_id: str | None = None)
     return success
 
 
+async def notify_personal(tg_page: Page, message: str) -> None:
+    """Envia alerta de erro/inesperado apenas para o ID pessoal."""
+    await send_telegram(tg_page, message, chat_id=PERSONAL_CHAT_ID)
+
+
 async def send_status(tg_page: Page) -> None:
     """Envia relatório de status periódico para todos os chats."""
     uptime = datetime.now() - inicio
@@ -152,7 +160,14 @@ async def get_sectors(page: Page) -> list[dict]:
 
 # ── Verificação de evento direto ──────────────────────────────────────────────
 
-async def check_direct_event(browser: Browser, name: str, url: str) -> tuple[bool, list[dict]]:
+async def check_direct_event(browser: Browser, name: str, url: str) -> tuple[str, list[dict]]:
+    """
+    Retorna (status, sectors) onde status é um de:
+      'soldout'   — div#picker-bar div.event-status.status-soldout presente
+      'available' — soldout ausente E botão 'Ingressos' / button#buyButton visível
+      'unknown'   — soldout ausente MAS nenhum botão reconhecido encontrado
+      'error'     — timeout ou falha ao carregar a página
+    """
     ctx = await browser.new_context(**CTX_ARGS)
     try:
         page = await ctx.new_page()
@@ -162,56 +177,91 @@ async def check_direct_event(browser: Browser, name: str, url: str) -> tuple[boo
             await page.wait_for_timeout(5_000)
         except PWTimeout:
             log.error(f"  [{name}] Timeout")
-            return False, []
+            return "error", []
 
-        # Padrão 1: dropdown
-        dropdown_btn = page.locator(".btn.dropdown-toggle.op-ini").first
-        if await dropdown_btn.count():
-            await dropdown_btn.click()
-            await page.wait_for_timeout(800)
-            first_item = page.locator(".dropdown-menu li").first
-            if await first_item.count():
-                cls = await first_item.get_attribute("class") or ""
-                txt = (await first_item.inner_text()).strip().lower()
-                is_soldout = "agotado" in cls or txt.startswith("esgotado")
-                await page.keyboard.press("Escape")
-                if is_soldout:
-                    log.info(f"  [{name}] ESGOTADO (dropdown)")
-                    return False, []
-            else:
-                await page.keyboard.press("Escape")
+        # ── Camada 1: picker-bar com status-soldout (elemento primário) ──────────
+        soldout_el = page.locator("div#picker-bar div.event-status.status-soldout")
+        if await soldout_el.count() > 0:
+            log.info(f"  [{name}] ESGOTADO (picker-bar status-soldout)")
+            return "soldout", []
 
-        # Padrão 2: card de status
-        status_el = page.locator("[class*='event-status']").first
-        if await status_el.count():
-            if "status-soldout" in (await status_el.get_attribute("class") or ""):
-                log.info(f"  [{name}] ESGOTADO (event-status)")
-                return False, []
+        # ── Camada 2: qualquer elemento de status com texto "esgotado" ──────────
+        status_spans = page.locator("[class*='event-status'] span, [class*='status-soldout'] span")
+        for i in range(await status_spans.count()):
+            txt = (await status_spans.nth(i).inner_text()).strip().lower()
+            if "esgotado" in txt:
+                log.info(f"  [{name}] ESGOTADO (status span fallback)")
+                return "soldout", []
 
+        # ── Camada 3: texto bruto do início da página ────────────────────────────
         body_text = (await page.inner_text("body")).lower()
+        if "esgotado" in body_text[:1500]:
+            log.info(f"  [{name}] ESGOTADO (texto body)")
+            return "soldout", []
 
-        # Texto esgotado no topo da página
-        if "esgotado" in body_text[:600]:
-            log.info(f"  [{name}] ESGOTADO (texto)")
-            return False, []
+        # ── Camada 4: confirmação positiva — botão Ingressos visível ────────────
+        ingressos_loc = page.locator(
+            "button#buyButton, "
+            "button:has-text('Ingressos'), "
+            "a:has-text('Ingressos')"
+        )
+        has_ingressos = False
+        for i in range(await ingressos_loc.count()):
+            if await ingressos_loc.nth(i).is_visible():
+                has_ingressos = True
+                break
 
-        # Confirmação positiva: só reporta disponível se houver botão de compra visível
-        # ou dropdown sem esgotado. Sem confirmação → assume indisponível (evita falso alarme).
-        has_buy_btn = await page.locator(".btn.btn-primary:visible").count() > 0
-        has_dropdown = await page.locator(".btn.dropdown-toggle.op-ini").count() > 0
-        if not has_buy_btn and not has_dropdown:
-            log.info(f"  [{name}] Página sem elementos de compra — assumindo indisponível")
-            return False, []
+        if has_ingressos:
+            log.info(f"  [{name}] DISPONÍVEL — botão 'Ingressos' encontrado")
+            sectors = await get_sectors(page)
+            return "available", sectors or [{"name": "Verificar setores no link", "price": ""}]
 
-        sectors = await get_sectors(page)
-        return True, sectors or [{"name": "Verificar setores no link", "price": ""}]
+        # ── Camada 5: página com conteúdo real mas sem elementos de compra ───────
+        # Indica pré-venda não iniciada ("soon") — sem alarme.
+        # Só marca "unknown" se a página parece quebrada/bloqueada (conteúdo mínimo).
+        REAL_CONTENT_SIGNALS = ["r$", "morumbi", "ingresso", "classificação", "portões"]
+        page_seems_real = (
+            len(body_text) > 400
+            and any(sig in body_text[:3000] for sig in REAL_CONTENT_SIGNALS)
+        )
+        if page_seems_real:
+            log.info(f"  [{name}] Pré-venda não iniciada (sem botão de compra) — aguardando")
+            return "soon", []
+
+        log.warning(f"  [{name}] Página suspeita/bloqueada — conteúdo não reconhecido")
+        return "unknown", []
     finally:
         await ctx.close()
 
 
 # ── Verificação de landing page ───────────────────────────────────────────────
 
-async def check_landing_page(browser: Browser, landing_url: str) -> list[dict]:
+_AVAILABLE_KEYWORDS = ["À VENDA", "A VENDA", "DISPONÍVEL", "DISPONIVEL", "INGRESSOS"]
+
+def _link_is_soldout(link_text: str) -> bool:
+    return "ESGOTADO" in link_text.upper()
+
+def _link_is_available(link_text: str) -> bool:
+    upper = link_text.upper()
+    return any(kw in upper for kw in _AVAILABLE_KEYWORDS)
+
+
+def _error_entry(event_url: str, reason: str) -> dict:
+    return {"event_url": event_url, "date": "", "title": "", "status": "error", "reason": reason, "link_text": "", "sectors": []}
+
+
+async def check_landing_page(browser: Browser, name: str, landing_url: str) -> list[dict]:
+    """
+    Para cada card .tmpe-ticket-item verifica dois indicadores de esgotado:
+      1. a.tmpe-link-details com texto 'ESGOTADO'
+      2. .tmpe-status-badge contendo .tmpe-dot-soldout
+
+    Status por card:
+      esgotado  — qualquer indicador acima presente
+      available — nenhum indicador de esgotado E link exibe 'À VENDA' / 'DISPONÍVEL' / 'INGRESSOS'
+      unknown   — nenhum indicador de esgotado mas texto do link não reconhecido
+      error     — timeout ou sem cards (entrada única representando a landing inteira)
+    """
     ctx = await browser.new_context(**CTX_ARGS)
     try:
         page = await ctx.new_page()
@@ -220,37 +270,51 @@ async def check_landing_page(browser: Browser, landing_url: str) -> list[dict]:
             await page.goto(landing_url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(4_000)
         except PWTimeout:
-            log.error(f"Timeout landing {landing_url}")
-            return []
+            log.error(f"Timeout landing {name}")
+            return [_error_entry(landing_url, "timeout")]
 
         desktop = page.locator(".tmpe-desktop-view")
         container = desktop if await desktop.count() else page.locator("body")
         cards = await container.locator(".tmpe-ticket-item").all()
 
         if not cards:
-            log.warning("Nenhum card encontrado na landing page.")
-            return []
+            log.warning(f"Nenhum card encontrado na landing page: {name}")
+            return [_error_entry(landing_url, "no_cards")]
 
         results = []
         for card in cards:
-            dot = card.locator(".tmpe-status-dot").first
-            dot_cls = await dot.get_attribute("class") or "" if await dot.count() else ""
             date_txt = (await card.locator(".tmpe-date-text").inner_text()).strip() if await card.locator(".tmpe-date-text").count() else "?"
             title_txt = (await card.locator(".tmpe-ticket-title").inner_text()).strip() if await card.locator(".tmpe-ticket-title").count() else ""
+
             link = card.locator("a.tmpe-link-details").first
-            event_url = await link.get_attribute("href") or landing_url if await link.count() else landing_url
+            link_count = await link.count()
+            event_url = (await link.get_attribute("href") or landing_url) if link_count else landing_url
+            link_text = (await link.inner_text()).strip() if link_count else ""
 
-            if "tmpe-dot-soldout" in dot_cls:
-                log.info(f"  [{title_txt} {date_txt}] ESGOTADO")
-                results.append({"event_url": event_url, "date": date_txt, "title": title_txt, "status": "esgotado", "sectors": []})
+            # Indicador 1: texto do link
+            soldout_by_link = _link_is_soldout(link_text)
+
+            # Indicador 2: badge com dot esgotado
+            soldout_by_badge = await card.locator(".tmpe-status-badge .tmpe-dot-soldout").count() > 0
+
+            if soldout_by_link or soldout_by_badge:
+                reason = "link" if soldout_by_link else "badge"
+                log.info(f"  [{title_txt} {date_txt}] ESGOTADO ({reason})")
+                results.append({
+                    "event_url": event_url, "date": date_txt, "title": title_txt,
+                    "status": "esgotado", "link_text": link_text, "sectors": [],
+                })
                 continue
 
-            if "tmpe-dot-soon" in dot_cls:
-                log.info(f"  [{title_txt} {date_txt}] EM BREVE")
-                results.append({"event_url": event_url, "date": date_txt, "title": title_txt, "status": "em_breve", "sectors": []})
+            if not _link_is_available(link_text):
+                log.warning(f"  [{title_txt} {date_txt}] Label inesperada: '{link_text}'")
+                results.append({
+                    "event_url": event_url, "date": date_txt, "title": title_txt,
+                    "status": "unknown", "link_text": link_text, "sectors": [],
+                })
                 continue
 
-            log.info(f"  [{title_txt} {date_txt}] DISPONÍVEL — verificando setores...")
+            log.info(f"  [{title_txt} {date_txt}] DISPONÍVEL ('{link_text}') — verificando setores...")
             sectors: list[dict] = []
             try:
                 await page.goto(event_url, wait_until="domcontentloaded", timeout=30_000)
@@ -262,7 +326,10 @@ async def check_landing_page(browser: Browser, landing_url: str) -> list[dict]:
             except PWTimeout:
                 log.error(f"  Timeout ao entrar em {event_url}")
 
-            results.append({"event_url": event_url, "date": date_txt, "title": title_txt, "status": "available", "sectors": sectors})
+            results.append({
+                "event_url": event_url, "date": date_txt, "title": title_txt,
+                "status": "available", "link_text": link_text, "sectors": sectors,
+            })
 
         return results
     finally:
@@ -313,6 +380,7 @@ async def main():
     notified_direct: set[str] = set()
     card_states: dict[str, str] = {}
     notified_landing: set[str] = set()
+    alerted_errors: set[str] = set()   # evita spam de alertas de erro repetidos
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -323,7 +391,20 @@ async def main():
         # Navega para google.com — fetch() cross-origin ao Telegram funciona a partir daqui no WSL
         await tg_page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=15_000)
 
-        log.info("Telegram pronto. Iniciando monitoramento...\n")
+        log.info("Telegram pronto. Buscando chat IDs recentes via getUpdates...")
+        updates = await tg_get(tg_page, "getUpdates", {"limit": "20", "timeout": "0"})
+        seen_chats: set[str] = set()
+        for upd in (updates.get("result") or []):
+            chat = (upd.get("message") or upd.get("my_chat_member") or {}).get("chat", {})
+            cid = str(chat.get("id", ""))
+            ctype = chat.get("type", "")
+            ctitle = chat.get("title") or chat.get("username") or chat.get("first_name") or ""
+            if cid and cid not in seen_chats:
+                seen_chats.add(cid)
+                log.info(f"  Chat encontrado → id={cid}  tipo={ctype}  nome='{ctitle}'")
+        if not seen_chats:
+            log.info("  Nenhuma conversa recente. Adicione o bot a um grupo e envie uma mensagem, depois reinicie.")
+        log.info("")
 
         # getUpdates não funciona neste ambiente WSL — usamos relatório periódico a cada 30min
         STATUS_INTERVAL = 30 * 60  # segundos
@@ -343,7 +424,7 @@ async def main():
                 log.info(f"── Ciclo #{checagens} {'─' * 40}")
 
                 # Dispara todas as checagens em paralelo
-                tasks = [check_landing_page(browser, lp["url"]) for lp in LANDING_PAGES]
+                tasks = [check_landing_page(browser, lp["name"], lp["url"]) for lp in LANDING_PAGES]
                 tasks += [check_direct_event(browser, ev["name"], ev["url"]) for ev in DIRECT_EVENTS]
 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -351,49 +432,117 @@ async def main():
                 # Processa resultados das landing pages
                 for i, lp in enumerate(LANDING_PAGES):
                     result = results[i]
+                    lp_url = lp["url"]
+                    lp_name = lp["name"]
+
                     if isinstance(result, Exception):
-                        log.error(f"Erro na landing {lp['name']}: {result}")
+                        log.error(f"Erro inesperado na landing {lp_name}: {result}")
+                        if lp_url not in alerted_errors:
+                            await notify_personal(tg_page, (
+                                f"⚠️ <b>Erro inesperado — {lp_name}</b>\n"
+                                f"{result}\n"
+                                f"<i>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</i>"
+                            ))
+                            alerted_errors.add(lp_url)
                         continue
+
+                    # Resultado bem-sucedido: limpa erro de nível de página
+                    if result and result[0]["status"] != "error":
+                        alerted_errors.discard(lp_url)
+
                     new_available: list[dict] = []
                     for card in result:
                         ev_url = card["event_url"]
-                        prev = card_states.get(ev_url)
                         curr = card["status"]
+                        prev = card_states.get(ev_url)
+
                         if prev and prev != curr:
                             log.info(f"  MUDANÇA: {card['title']} {card['date']}: {prev.upper()} → {curr.upper()}")
                         card_states[ev_url] = curr
-                        if curr != "available":
+
+                        if curr == "available":
+                            alerted_errors.discard(ev_url)
+                            if ev_url not in notified_landing:
+                                new_available.append(card)
+
+                        elif curr in ("error", "unknown"):
                             notified_landing.discard(ev_url)
-                            continue
-                        if ev_url not in notified_landing:
-                            new_available.append(card)
+                            if ev_url not in alerted_errors:
+                                if curr == "error":
+                                    reason = card.get("reason", "")
+                                    detail = "página offline ou timeout" if reason == "timeout" else "nenhum card encontrado na página"
+                                    label = lp_name
+                                else:
+                                    label_txt = card.get("link_text", "") or "(vazio)"
+                                    detail = f"label inesperada: <code>{label_txt}</code>"
+                                    label = f"{card['title']} {card['date']}".strip() or lp_name
+                                await notify_personal(tg_page, (
+                                    f"⚠️ <b>{lp_name}</b> — {label}\n"
+                                    f"{detail}\n"
+                                    f"<i>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</i>"
+                                ))
+                                alerted_errors.add(ev_url)
+
+                        else:  # esgotado
+                            notified_landing.discard(ev_url)
+                            alerted_errors.discard(ev_url)
+
                     if new_available:
                         log.info(f"  {len(new_available)} data(s) disponível(is)! Notificando...")
-                        await notify_landing(tg_page, lp["name"], new_available)
+                        await notify_landing(tg_page, lp_name, new_available)
                         for card in new_available:
                             notified_landing.add(card["event_url"])
 
                 # Processa resultados dos eventos diretos
                 for j, ev in enumerate(DIRECT_EVENTS):
                     result = results[len(LANDING_PAGES) + j]
+                    ev_url = ev["url"]
+                    ev_name = ev["name"]
+
                     if isinstance(result, Exception):
-                        log.error(f"Erro no evento {ev['name']}: {result}")
+                        log.error(f"Erro inesperado no evento {ev_name}: {result}")
+                        if ev_url not in alerted_errors:
+                            await notify_personal(tg_page, (
+                                f"⚠️ <b>Erro inesperado — {ev_name}</b>\n"
+                                f"{result}\n"
+                                f"<i>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</i>"
+                            ))
+                            alerted_errors.add(ev_url)
                         continue
-                    available, sectors = result
-                    url = ev["url"]
-                    name = ev["name"]
-                    if not available:
-                        if url in notified_direct:
-                            log.info(f"  [{name}] Voltou a ficar indisponível.")
-                        notified_direct.discard(url)
-                    else:
-                        log.info(f"  [{name}] DISPONÍVEL! Setores: {[s['name'] for s in sectors]}")
-                        if url not in notified_direct:
-                            await notify_direct(tg_page, name, url, sectors)
+
+                    status, sectors = result
+
+                    if status in ("soldout", "soon"):
+                        if ev_url in notified_direct:
+                            log.info(f"  [{ev_name}] Voltou a ficar indisponível.")
+                        notified_direct.discard(ev_url)
+                        alerted_errors.discard(ev_url)
+
+                    elif status == "available":
+                        alerted_errors.discard(ev_url)
+                        log.info(f"  [{ev_name}] DISPONÍVEL! Setores: {[s['name'] for s in sectors]}")
+                        if ev_url not in notified_direct:
+                            await notify_direct(tg_page, ev_name, ev_url, sectors)
                             log.info(f"  -> Telegram enviado.")
-                            notified_direct.add(url)
+                            notified_direct.add(ev_url)
                         else:
                             log.info(f"  -> (sem mudança, Telegram já enviado)")
+
+                    elif status in ("error", "unknown"):
+                        notified_direct.discard(ev_url)
+                        if ev_url not in alerted_errors:
+                            detail = (
+                                "página offline ou timeout"
+                                if status == "error"
+                                else "nenhum elemento reconhecido (nem esgotado nem Ingressos)"
+                            )
+                            await notify_personal(tg_page, (
+                                f"⚠️ <b>{ev_name}</b>\n"
+                                f"{detail}\n"
+                                f"<i>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</i>"
+                            ))
+                            alerted_errors.add(ev_url)
+                            log.warning(f"  [{ev_name}] {status.upper()} → alerta pessoal enviado")
 
                 log.info(f"Próxima verificação em {CHECK_INTERVAL}s...\n")
                 await asyncio.sleep(CHECK_INTERVAL)
@@ -407,9 +556,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
-        log.error("Configuração incompleta no .env")
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN não configurado no .env")
         exit(1)
+    if not TELEGRAM_CHAT_IDS:
+        log.warning("TELEGRAM_CHAT_IDS vazio — notificações de disponibilidade não serão enviadas. Aguardando descoberta de IDs via getUpdates.")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
