@@ -124,9 +124,9 @@ def _build_status_msg() -> str:
 
 
 async def send_status(tg_page: Page) -> None:
-    """Envia relatório de status periódico para todos os chats."""
+    """Envia relatório de status periódico apenas para o ID pessoal."""
     msg = _build_status_msg()
-    await send_telegram(tg_page, msg)
+    await notify_personal(tg_page, msg)
     log.info(f"Status periódico enviado ({checagens} ciclos)")
 
 
