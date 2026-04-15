@@ -9,7 +9,8 @@ CHECK_INTERVAL = 5
 IGNORE_TICKET_TYPES: list[str] = []
 
 # ── Páginas de landing (listam múltiplas datas) ──────────────────────────────
-# O bot varre todos os cards, entra nos disponíveis e verifica os setores.
+# Detecção: link a.tmpe-link-details com texto "ESGOTADO" OU badge tmpe-dot-soldout.
+# Notifica quando qualquer card muda para 'À VENDA', 'DISPONÍVEL' ou 'INGRESSOS'.
 LANDING_PAGES = [
     {
         "name": "BTS World Tour Arirang",
@@ -17,19 +18,20 @@ LANDING_PAGES = [
     },
 ]
 
-# ── Páginas de evento direto (pré-vendas, datas específicas) ─────────────────
-# O bot verifica se o dropdown da data está como 'agotado' ou não.
+# ── Páginas de evento direto (datas específicas da venda geral) ───────────────
+# Detecção: div.event-picker div.event-status.status-soldout desaparece
+#           E surge button/link com texto "Ingressos".
 DIRECT_EVENTS = [
     {
-        "name": "Pré-venda ARMY - 28/10",
-        "url": "https://www.ticketmaster.com.br/event/pre-venda-army-membership-bts-world-tour-arirang-28-10",
+        "name": "Venda Geral - 28/10",
+        "url": "https://www.ticketmaster.com.br/event/venda-geral-bts-world-tour-arirang-28-10",
     },
     {
-        "name": "Pré-venda ARMY - 30/10",
-        "url": "https://www.ticketmaster.com.br/event/pre-venda-army-membership-bts-world-tour-arirang-30-10",
+        "name": "Venda Geral - 30/10",
+        "url": "https://www.ticketmaster.com.br/event/venda-geral-bts-world-tour-arirang-30-10",
     },
     {
-        "name": "Pré-venda ARMY - 31/10",
-        "url": "https://www.ticketmaster.com.br/event/pre-venda-army-membership-bts-world-tour-arirang-31-10",
+        "name": "Venda Geral - 31/10",
+        "url": "https://www.ticketmaster.com.br/event/venda-geral-bts-world-tour-arirang-31-10",
     },
 ]
